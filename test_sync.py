@@ -217,6 +217,41 @@ class Integration(unittest.TestCase):
         return self.sync.run(str(self.root / 'a.git'), str(self.root / 'b.git'),
                              'feature', 'release', selected=commits, message=message)
 
+    def test_url_source_single_commit_sync_omits_unselected_blobs_and_other_branches(self):
+        first, skipped, last = self.selected_fixture()
+        self.g(self.root / 'a.git', 'config', 'uploadpack.allowFilter', 'true')
+        skipped_blob = self.g(self.a, 'rev-parse', skipped + ':unselected.txt')
+        for work in [self.a, self.b]:
+            current = self.g(work, 'branch', '--show-current')
+            self.g(work, 'checkout', '-b', 'unrelated')
+            (work / 'unrelated.txt').write_text('Not needed for this sync')
+            self.commit(work, 'Unrelated branch')
+            self.g(work, 'push', 'origin', 'unrelated')
+            self.g(work, 'checkout', current)
+        before_status = self.g(self.b, 'status', '--porcelain')
+        calls = []
+        original = sync_tool.git
+        def record(repo, *args, **kwargs):
+            calls.append((Path(repo), args))
+            return original(repo, *args, **kwargs)
+        args = (str(self.root / 'a.git'), str(self.root / 'b.git'), 'feature', 'release')
+        with patch('sync_tool.git', side_effect=record):
+            self.sync.run(*args, selected=[last], message='Only one commit', local_b=str(self.b))
+        repo = next((self.root / 'state').glob('*/repo'))
+        self.assertEqual(set(self.g(repo, 'for-each-ref', '--format=%(refname)', 'refs/remotes/').splitlines()),
+                         {'refs/remotes/source/feature', 'refs/remotes/target/release'})
+        self.assertEqual(self.g(repo, 'rev-parse', '--is-shallow-repository'), 'false')
+        missing = self.g(repo, 'rev-list', '--objects', '--missing=print',
+                         'refs/remotes/source/feature')
+        self.assertIn('?' + skipped_blob, missing.splitlines())
+        self.assertEqual(self.g(self.root / 'b.git', 'show', 'release:last.txt'), 'last')
+        self.assertNotIn('unselected.txt', self.g(self.root / 'b.git', 'ls-tree', '--name-only', 'release'))
+        self.assertEqual(self.g(self.b, 'status', '--porcelain'), before_status)
+        fetches = [args for _, args in calls if args and args[0] == 'fetch']
+        self.assertTrue(any('--filter=blob:none' in args for args in fetches))
+        self.assertFalse(any('refs/heads/*:' in value for args in fetches for value in args))
+        self.assertFalse(any('--depth=15' in args for args in fetches))
+
     def test_selected_two_squash_preserves_other_commits(self):
         first, skipped, last = self.selected_fixture()
         bare = self.root / 'b.git'

@@ -343,8 +343,8 @@ class Sync:
 
     def _run(self, folder, a, b, branch_a, branch_b, initialize, *, selected, message,
              list_only, source, target, preserve_commits):
-        # Keep metadata-only previews separate from the complete sync repository.
-        # Otherwise a subsequent sync can trigger many individual lazy blob downloads.
+        # Preview is shallow; sync keeps the full commit graph for ancestry checks.
+        # URL-only sources omit historical file blobs until Git actually needs them.
         repo = folder / ('preview-repo' if list_only else 'repo')
         statefile = folder / 'state.json'
         if not repo.exists():
@@ -390,6 +390,8 @@ class Sync:
                                step='Push to Source B using its local repo configuration')
             return network(repo, 'push', 'target', commit + ':refs/heads/' + branch_b,
                            step='Push to Source B')
+        target_heads = {}
+        target_defaults = []
         for remote, settings in [('source', source), ('target', target)]:
             if list_only and remote == 'target':
                 continue
@@ -414,15 +416,56 @@ class Sync:
                     network(repo, 'fetch', '--depth=15', '--no-tags', '--no-recurse-submodules', '--filter=blob:none',
                             remote, refspec, step='Fetch source branch preview')
                 continue
+            branches = [branch_a]
+            if remote == 'target':
+                # Discover names only; do not download every B branch to find a base.
+                advertised = network(local or repo, 'ls-remote', '--symref',
+                                     settings['target'] if local else remote,
+                                     'HEAD', 'refs/heads/*', step='Read Source B branches').decode()
+                for line in advertised.splitlines():
+                    fields = line.split()
+                    if len(fields) == 3 and fields[0] == 'ref:' and fields[2] == 'HEAD':
+                        target_defaults.append(fields[1].removeprefix('refs/heads/'))
+                    elif len(fields) == 2 and fields[1].startswith('refs/heads/'):
+                        target_heads[fields[1].removeprefix('refs/heads/')] = fields[0]
+                if branch_b in target_heads:
+                    branches = [branch_b]
+                elif base_branch:
+                    branches = [base_branch] if base_branch in target_heads else []
+                else:
+                    candidates = target_defaults + ['main', 'master']
+                    branches = next(([name] for name in candidates if name in target_heads),
+                                    list(target_heads) if len(target_heads) == 1 else [])
+            wanted = {'refs/remotes/' + remote + '/' + name for name in branches}
+            # A reused cache must not retain deleted or unrelated remote-tracking refs.
+            cached = git(repo, 'for-each-ref', '--format=%(refname)',
+                         'refs/remotes/' + remote + '/').decode().splitlines()
+            for ref in cached:
+                if ref not in wanted:
+                    git(repo, 'update-ref', '-d', ref)
+            if not branches:
+                continue
+            self.log('Fetching only ' + remote + ' branch(es): ' + ', '.join(branches))
             if local:
                 namespace = 'refs/git-sync-tool/' + hashlib.sha256(url.encode()).hexdigest() + '/'
                 self.log('Updating local ' + remote + ' Git data from server; working files remain untouched.')
-                network(local, 'fetch', '--no-tags', '--prune', settings['target'],
-                        '+refs/heads/*:' + namespace + '*', step='Fetch ' + remote + ' using its existing local repo')
-                git(repo, 'fetch', '--no-tags', '--prune', str(local), '+' + namespace + '*:refs/remotes/' + remote + '/*')
+                network(local, 'fetch', '--no-tags', '--no-recurse-submodules', settings['target'],
+                        *['+refs/heads/' + name + ':' + namespace + name for name in branches],
+                        step='Fetch ' + remote + ' using its existing local repo')
+                git(repo, 'fetch', '--no-tags', '--no-recurse-submodules', str(local),
+                    *['+' + namespace + name + ':refs/remotes/' + remote + '/' + name for name in branches])
             else:
-                network(repo, 'fetch', '--no-tags', '--prune', remote,
-                        '+refs/heads/*:refs/remotes/' + remote + '/*', step='Fetch ' + remote)
+                options = []
+                if remote == 'source':
+                    # Keep all commits/trees, but not the file contents of old revisions.
+                    # Git obtains the blobs needed for the chosen patch/snapshot on demand.
+                    git(repo, 'config', 'remote.source.promisor', 'true')
+                    git(repo, 'config', 'remote.source.partialclonefilter', 'blob:none')
+                    options = ['--filter=blob:none']
+                    self.log('Source A: omitting historical file contents where supported by the server.')
+                network(repo, 'fetch', '--no-tags', '--no-recurse-submodules', *options, remote,
+                        *['+refs/heads/' + name + ':refs/remotes/' + remote + '/' + name for name in branches],
+                        step='Fetch ' + remote)
         ahead = sha('refs/remotes/source/' + branch_a)
         if list_only:
             ledger = folder / 'selected-state.json'
@@ -440,7 +483,7 @@ class Sync:
             return [dict(zip(('sha', 'parents', 'author', 'subject'), line.split('\x00', 3)),
                          applied=line.split('\x00', 1)[0] in applied)
                     for line in rows.splitlines() if line]
-        refs = git(repo, 'for-each-ref', '--format=%(refname)', 'refs/remotes/target/').decode().splitlines()
+        refs = ['refs/remotes/target/' + name for name in target_heads]
         bref = 'refs/remotes/target/' + branch_b
         exists = bref in refs
         empty_target = not refs
@@ -479,11 +522,7 @@ class Sync:
             bhead = sha(base_ref)
             self.log('Creating B branch ' + branch_b + ' from server base branch ' + base_branch + ' on push.')
         else:
-            head = network(target['local'] or repo, 'ls-remote', '--symref',
-                           target['target'] if target['local'] else 'target', 'HEAD',
-                           step='Read Source B default branch').decode()
-            defaults = [line.split()[1] for line in head.splitlines() if line.startswith('ref: refs/heads/')]
-            default_refs = ['refs/remotes/target/' + ref[len('refs/heads/'):] for ref in defaults]
+            default_refs = ['refs/remotes/target/' + name for name in target_defaults]
             candidates = [ref for ref in default_refs if ref in refs]
             if not candidates:
                 candidates = [ref for ref in ('refs/remotes/target/main', 'refs/remotes/target/master') if ref in refs]
