@@ -23,7 +23,7 @@ def push_error_message(step, error):
                                         or 'without workflow scope' in detail.lower()):
         return ('GitHub refused the push because the current login lacks workflow permission.\n'
                 'Authorize workflow access for the HTTPS credential, or use an authorized SSH key.\n'
-                'The workflow file is retained and the pending sync is saved. After fixing access, click Sync again.\n'
+                'No workflow files were removed. After fixing access, click Sync again.\n'
                 'Help: https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps\n\n'
                 + detail)
     return (step + ' failed. Check the server URL and Git/SSH access. '
@@ -65,7 +65,8 @@ def history_label(record):
 def history_details(record):
     inputs = record['inputs']
     return ('A: ' + history_repository(inputs[0]) + ' | ' + inputs[2] + ' | Folder: ' + (inputs[4] or '(private cache)')
-            + '\nB: ' + history_repository(inputs[1]) + ' | ' + inputs[3] + ' | Folder: ' + (inputs[5] or '(private cache)'))
+            + '\nB: ' + history_repository(inputs[1]) + ' | ' + inputs[3] + ' | Folder: ' + (inputs[5] or '(private cache)')
+            + (' | Base branch: ' + inputs[6] if len(inputs) > 6 and inputs[6] else ''))
 
 
 def local_repository(value, url=''):
@@ -120,7 +121,8 @@ class HistoryStore:
             urls.append(value)
         folders = [ntpath.normcase(ntpath.normpath(value.strip().strip('"'))) if value.strip() else ''
                    for value in inputs[4:6]]
-        return tuple(urls + [value.strip() for value in inputs[2:4]] + folders)
+        base = [inputs[6].strip()] if len(inputs) > 6 and inputs[6].strip() else []
+        return tuple(urls + [value.strip() for value in inputs[2:4]] + folders + base)
 
     def read(self):
         if not self.path.exists():
@@ -129,7 +131,7 @@ class HistoryStore:
             rows = json.loads(self.path.read_text(encoding='utf-8'))
             if not isinstance(rows, list) or any(not isinstance(row, dict)
                     or not isinstance(row.get('id'), str)
-                    or not isinstance(row.get('inputs'), list) or len(row['inputs']) != 6
+                    or not isinstance(row.get('inputs'), list) or len(row['inputs']) not in (6, 7)
                     or not all(isinstance(item, str) for item in row['inputs'])
                     or not isinstance(row.get('message'), str)
                     or not isinstance(row.get('time'), str) or not isinstance(row.get('status'), str)
@@ -193,14 +195,30 @@ class HistoryStore:
             self._write(lambda rows: None)
 
 
-def git(repo, *args, data=None, identity=None, author=None):
+def git(repo, *args, data=None, identity=None, author=None, progress=None):
     env = dict(os.environ, GIT_TERMINAL_PROMPT='0', GCM_INTERACTIVE='Never')
     if identity:
         for role in ('AUTHOR', 'COMMITTER'):
             env['GIT_' + role + '_NAME'], env['GIT_' + role + '_EMAIL'] = identity
     if author:
         env['GIT_AUTHOR_NAME'], env['GIT_AUTHOR_EMAIL'], env['GIT_AUTHOR_DATE'] = author
-    p = subprocess.run(['git', '-C', str(repo), *args], input=data,
+    command = ['git', '-C', str(repo), *args]
+    if progress is not None:
+        if data is not None:
+            raise ValueError('Progress streaming does not accept stdin data.')
+        output = []
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              env=env, text=True, encoding='utf-8', errors='replace') as process:
+            for line in process.stdout:
+                line = line.rstrip()
+                if line:
+                    output.append(line)
+                    progress(line)
+            code = process.wait()
+        if code:
+            raise SyncError('\n'.join(output) or 'Git command failed')
+        return '\n'.join(output).encode('utf-8')
+    p = subprocess.run(command, input=data,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     if p.returncode:
         raise SyncError(p.stderr.decode(errors='replace').strip() or 'Git command failed')
@@ -216,8 +234,10 @@ def sync_key(a, b, branch_a, branch_b):
 def switch_sources(fields):
     values = [field.get() for field in fields]
     swapped = [values[1], values[0], values[3], values[2]]
-    if len(values) == 6:
+    if len(values) >= 6:
         swapped += [values[5], values[4]]
+    if len(values) > 6:
+        swapped.append('')  # The base belongs to B, not the newly swapped destination.
     for field, value in zip(fields, swapped):
         field.delete(0, 'end')
         field.insert(0, value)
@@ -287,11 +307,13 @@ class Sync:
             raise SyncError('Server sync completed, but local B could not be updated: ' + str(exc)) from exc
 
     def run(self, a, b, branch_a, branch_b, initialize=False, *, selected=None,
-            message=None, list_only=False, local_a=None, local_b=None, preserve_commits=False):
+            message=None, list_only=False, local_a=None, local_b=None, preserve_commits=False,
+            base_branch=''):
         a, b, branch_a, branch_b = (value.strip() for value in (a, b, branch_a, branch_b))
         source = repository_settings(a, local_a)
         target = repository_settings(b, local_b)
         target['folder_hint'] = local_b
+        target['base_branch'] = (base_branch or '').strip()
         for label, requested, settings in [('A', local_a, source), ('B', local_b, target)]:
             if requested and not settings['local']:
                 if label == 'B':
@@ -321,11 +343,15 @@ class Sync:
 
     def _run(self, folder, a, b, branch_a, branch_b, initialize, *, selected, message,
              list_only, source, target, preserve_commits):
-        repo, statefile = folder / 'repo', folder / 'state.json'
+        # Keep metadata-only previews separate from the complete sync repository.
+        # Otherwise a subsequent sync can trigger many individual lazy blob downloads.
+        repo = folder / ('preview-repo' if list_only else 'repo')
+        statefile = folder / 'state.json'
         if not repo.exists():
             repo.mkdir()
             git(repo, 'init')
-        for branch in (branch_a, branch_b):
+        base_branch = target.get('base_branch', '')
+        for branch in (branch_a, branch_b, *([base_branch] if base_branch else [])):
             git(repo, 'check-ref-format', '--branch', branch)
             if branch.startswith('-') or branch == 'HEAD':
                 raise SyncError('Invalid branch name.')
@@ -344,14 +370,17 @@ class Sync:
             return p.returncode == 0
         def network(context, *args, step):
             try:
+                if args and args[0] == 'fetch':
+                    return git(context, args[0], '--progress', *args[1:], progress=self.log)
                 return git(context, *args)
             except SyncError as exc:
                 raise SyncError(push_error_message(step, exc)) from exc
+        exact_copy = preserve_commits and not selected and not (message or '').strip() and not base_branch
         def push(commit):
             introduced = git(repo, 'log', '--format=', '--name-only', commit,
-                             '--not', '--remotes=target', '--', '.github/workflows')
+                             '--not', '--remotes=target', '--', '.github')
             if introduced.strip():
-                raise SyncError('The proposed push still contains workflow changes. Nothing was pushed; rebuild the sync with workflow exclusion.')
+                raise SyncError('The proposed push still contains .github changes. Nothing was pushed; rebuild the sync with .github exclusion.')
             if target['local']:
                 local = target['local']
                 # Import objects into a private ref, never into a user's branch/index.
@@ -367,7 +396,24 @@ class Sync:
             url, local = settings['url'], settings['local']
             names = git(repo, 'remote').decode().split()
             git(repo, 'remote', 'set-url', remote, url) if remote in names else git(repo, 'remote', 'add', remote, url)
-            self.log('Fetching ' + remote + '…')
+            self.log('Fetching ' + remote + (' branch ' + branch_a + ' (commit preview)…' if list_only else '…'))
+            if list_only:
+                # Bound preview history without making the actual sync repository shallow.
+                refspec = '+refs/heads/' + branch_a + ':refs/remotes/source/' + branch_a
+                if local:
+                    namespace = 'refs/git-sync-tool/' + hashlib.sha256(url.encode()).hexdigest() + '/'
+                    local_ref = namespace + branch_a
+                    network(local, 'fetch', '--no-tags', '--no-recurse-submodules', settings['target'],
+                            '+refs/heads/' + branch_a + ':' + local_ref,
+                            step='Fetch source branch using its existing local repo')
+                    git(repo, 'fetch', '--depth=15', '--no-tags', '--no-recurse-submodules', str(local),
+                        '+' + local_ref + ':refs/remotes/source/' + branch_a)
+                else:
+                    git(repo, 'config', 'remote.source.promisor', 'true')
+                    git(repo, 'config', 'remote.source.partialclonefilter', 'blob:none')
+                    network(repo, 'fetch', '--depth=15', '--no-tags', '--no-recurse-submodules', '--filter=blob:none',
+                            remote, refspec, step='Fetch source branch preview')
+                continue
             if local:
                 namespace = 'refs/git-sync-tool/' + hashlib.sha256(url.encode()).hexdigest() + '/'
                 self.log('Updating local ' + remote + ' Git data from server; working files remain untouched.')
@@ -382,7 +428,7 @@ class Sync:
             ledger = folder / 'selected-state.json'
             state = json.loads(ledger.read_text(encoding='utf-8')) if ledger.exists() else {}
             applied = set(state.get('applied', []))
-            rows = git(repo, 'log', '--topo-order', '--max-count=200',
+            rows = git(repo, 'log', '--topo-order', '--max-count=15',
                        '--format=%H%x00%P%x00%an%x00%s', ahead).decode('utf-8', errors='replace')
             listed = {line.split('\x00', 1)[0] for line in rows.splitlines() if line}
             for commit in selected or []:
@@ -390,15 +436,7 @@ class Sync:
                     continue
                 if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', commit):
                     raise SyncError('Invalid saved source commit ID.')
-                try:
-                    reachable = ancestor(commit, ahead)
-                except SyncError:
-                    reachable = False
-                if not reachable:
-                    self.log('Saved commit is no longer available on A: ' + commit[:12])
-                    continue
-                rows += git(repo, 'log', '-1', '--format=%H%x00%P%x00%an%x00%s', commit).decode('utf-8', errors='replace')
-                listed.add(commit)
+                self.log('Saved commit is outside the latest 15 commits; not loaded: ' + commit[:12])
             return [dict(zip(('sha', 'parents', 'author', 'subject'), line.split('\x00', 3)),
                          applied=line.split('\x00', 1)[0] in applied)
                     for line in rows.splitlines() if line]
@@ -408,8 +446,38 @@ class Sync:
         empty_target = not refs
         root_commit = False
         source_base = None
+        current = sha(bref) if exists else None
+        github_history = git(repo, 'log', '--format=', '--name-only', ahead, '--', '.github') if exact_copy and exists else b''
+        if exact_copy and exists and not github_history.strip() and ancestor(current, ahead):
+            if not exists or current != ahead:
+                push(ahead)
+            else:
+                self.log('Source B already matches A exactly; no push needed.')
+            imported = git(repo, 'rev-list', '--reverse', ahead).decode().split()
+            ledger = folder / 'selected-state.json'
+            temp = ledger.with_suffix('.tmp')
+            temp.write_text(json.dumps({'b': ahead, 'applied': imported}, indent=2), encoding='utf-8')
+            temp.replace(ledger)
+            self.log('Exact sync completed: original source commits and code retained. No commits were created.')
+            return dict(applied=imported)
+        if exact_copy and not exists:
+            # Import only the final tree, without any original parents that
+            # might contain .github. No historical patches need to be replayed.
+            tree = git(repo, 'mktree', data=b'').strip()
+            helper = b'tree ' + tree + b'\nauthor Git Sync Tool <internal@invalid> 0 +0000\ncommitter Git Sync Tool <internal@invalid> 0 +0000\n\nPrivate empty-tree anchor\n'
+            anchor = git(repo, 'hash-object', '-t', 'commit', '-w', '--stdin', data=helper).decode().strip()
+            self.log('Creating B from the latest A snapshot as one commit, with .github/ excluded.')
+            return self._selected(repo, folder, branch_b, ahead, anchor, False,
+                                  selected, message, ancestor, sha, push, automatic=True,
+                                  empty_target=True, root_commit=True, default_sync=True, initial_snapshot=True)
         if exists:
             bhead = sha(bref)
+        elif base_branch:
+            base_ref = 'refs/remotes/target/' + base_branch
+            if base_ref not in refs:
+                raise SyncError('Base branch ' + base_branch + ' does not exist on Source B server. Nothing was pushed.')
+            bhead = sha(base_ref)
+            self.log('Creating B branch ' + branch_b + ' from server base branch ' + base_branch + ' on push.')
         else:
             head = network(target['local'] or repo, 'ls-remote', '--symref',
                            target['target'] if target['local'] else 'target', 'HEAD',
@@ -448,7 +516,8 @@ class Sync:
         if preserve_commits or selected is not None or empty_target:
             return self._selected(repo, folder, branch_b, ahead, bhead, exists,
                                   selected, message, ancestor, sha, push, automatic=preserve_commits or (selected is None and empty_target),
-                                  empty_target=empty_target, root_commit=root_commit, source_base=source_base)
+                                  empty_target=empty_target, root_commit=root_commit, source_base=source_base,
+                                  base_branch=base_branch, default_sync=exact_copy)
         state = json.loads(statefile.read_text(encoding='utf-8')) if statefile.exists() else None
         if state and state.get('pending'):
             pending = state['pending']
@@ -480,7 +549,7 @@ class Sync:
         if ahead == state['a']:
             self.log('No new A changes.')
             return
-        patch = git(repo, 'diff', '--binary', '--full-index', '--no-renames', '--no-ext-diff', '--no-textconv', state['a'], ahead, '--', '.', ':(top,exclude).github/workflows')
+        patch = git(repo, 'diff', '--binary', '--full-index', '--no-renames', '--no-ext-diff', '--no-textconv', state['a'], ahead, '--', '.', ':(top,exclude).github')
         git(repo, 'checkout', '--detach', '--force', bhead)
         git(repo, 'clean', '-fd')
         if patch:
@@ -508,7 +577,8 @@ class Sync:
 
     def _selected(self, repo, folder, branch_b, ahead, bhead, exists,
                   selected, message, ancestor, sha, push, automatic=False,
-                  empty_target=False, root_commit=False, source_base=None):
+                  empty_target=False, root_commit=False, source_base=None, base_branch='',
+                  default_sync=False, initial_snapshot=False):
         if not automatic and not selected:
             raise SyncError('Select at least one source commit.')
         if not automatic and (not message or not message.strip()):
@@ -529,18 +599,24 @@ class Sync:
             backup.write_text(json.dumps(state, indent=2), encoding='utf-8')
             state = None
             self.log('B branch is absent. Rebuilding it from the source; the previous sync state was backed up.')
+        if initial_snapshot and state and state.get('pending') and not state.get('initial_snapshot'):
+            import uuid
+            backup = folder / ('pending-before-snapshot-' + uuid.uuid4().hex + '.json')
+            backup.write_text(json.dumps(state, indent=2), encoding='utf-8')
+            state = None
+            self.log('Rebuilding the old unpushed history plan as one latest-source snapshot; previous state was backed up.')
         if state and state.get('pending'):
             pending = state['pending']
             if exists and ancestor(pending['b'], bhead):
                 state = {'b': pending['b'], 'applied': pending['applied']}
                 save(state)
                 self.log('Recovered an already-pushed sync.')
-            elif (bhead == state['b'] or empty_target) and exists == state['branch_existed'] and not state.get('exclude_workflows'):
+            elif (bhead == state['b'] or empty_target) and exists == state['branch_existed'] and not state.get('exclude_github'):
                 import uuid
                 backup = folder / ('pending-before-workflow-filter-' + uuid.uuid4().hex + '.json')
                 backup.write_text(json.dumps(state, indent=2), encoding='utf-8')
                 state = {'b': state['b'], 'applied': state['applied']} if exists else None
-                self.log('Rebuilding the unpushed sync without .github/workflows/. The previous plan was backed up.')
+                self.log('Rebuilding the unpushed sync without .github/. The previous plan was backed up.')
             elif (bhead == state['b'] or empty_target) and exists == state['branch_existed']:
                 push(pending['b'])
                 save({'b': pending['b'], 'applied': pending['applied']})
@@ -551,7 +627,9 @@ class Sync:
         if state and (not exists or not ancestor(state['b'], bhead)):
             raise SyncError('B branch was deleted or rewritten. Manual review required.')
         applied = state.get('applied', []) if state else []
-        if automatic:
+        if initial_snapshot:
+            selected = {ahead}
+        elif automatic:
             anchors = [bhead]
             reachable = set(git(repo, 'rev-list', ahead).decode().split())
             for commit in applied:
@@ -570,14 +648,14 @@ class Sync:
             common = subprocess.run(['git', '-C', str(repo), 'merge-base', ahead, bhead], capture_output=True)
             if common.returncode not in (0, 1):
                 raise SyncError('Cannot determine the common source/target history.')
-            if not exists and not empty_target and not applied and common.returncode == 1:
+            if not exists and not empty_target and not applied and common.returncode == 1 and not base_branch:
                 self.log('New B branch has no common history with A. Initializing its full code from A, preserving B workflows.')
                 git(repo, 'checkout', '--detach', '--force', bhead)
                 git(repo, 'clean', '-fd')
                 git(repo, 'read-tree', '--reset', '-u', ahead)
-                git(repo, 'rm', '-r', '-f', '--ignore-unmatch', '--', '.github/workflows')
-                if git(repo, 'ls-tree', '--name-only', bhead, '--', '.github/workflows').strip():
-                    git(repo, 'checkout', bhead, '--', '.github/workflows')
+                git(repo, 'rm', '-r', '-f', '--ignore-unmatch', '--', '.github')
+                if git(repo, 'ls-tree', '--name-only', bhead, '--', '.github').strip():
+                    git(repo, 'checkout', bhead, '--', '.github')
                 result = bhead
                 if git(repo, 'diff', '--cached', '--name-only').strip():
                     identity = (git(repo, 'config', 'user.name').decode().strip(),
@@ -587,17 +665,22 @@ class Sync:
                     git(repo, 'commit', '-m', 'Initialize branch from source ' + ahead[:12] + ' (workflows excluded)', identity=identity)
                     result = sha('HEAD')
                 imported = git(repo, 'rev-list', '--reverse', ahead).decode().split()
-                save({'b': bhead, 'applied': [], 'branch_existed': False, 'exclude_workflows': True,
+                save({'b': bhead, 'applied': [], 'branch_existed': False, 'exclude_github': True,
                       'pending': {'b': result, 'applied': imported}})
                 push(result)
                 save({'b': result, 'applied': imported})
                 self.log('Created B branch and pushed the full source code. Future syncs will copy new commits separately.')
                 return dict(applied=imported)
             if not empty_target and not applied and not use_legacy and common.returncode == 1:
-                raise SyncError('A and B have unrelated histories, so the first automatic range is unknown. '
-                                'Select the initial commits and enter a message for the first sync.')
-            revisions = ahead + '\n' + ''.join('^' + anchor + '\n' for anchor in anchors)
-            selected = set(git(repo, 'rev-list', '--first-parent', '--reverse', '--stdin', data=revisions.encode()).decode().split())
+                if default_sync:
+                    selected = {ahead}
+                    self.log('Existing B has no common source history or saved baseline; syncing only the latest A commit.')
+                else:
+                    raise SyncError('A and B have unrelated histories, so the first automatic range is unknown. '
+                                    'Select the initial commits and enter a message for the first sync.')
+            else:
+                revisions = ahead + '\n' + ''.join('^' + anchor + '\n' for anchor in anchors)
+                selected = set(git(repo, 'rev-list', '--first-parent', '--reverse', '--stdin', data=revisions.encode()).decode().split())
         for commit in selected:
             if automatic:
                 continue
@@ -610,7 +693,7 @@ class Sync:
         if not requested:
             if automatic and not exists:
                 save({'b': bhead, 'applied': applied, 'branch_existed': False,
-                      'exclude_workflows': True, 'pending': {'b': bhead, 'applied': applied}})
+                      'exclude_github': True, 'pending': {'b': bhead, 'applied': applied}})
                 push(bhead)
                 save({'b': bhead, 'applied': applied})
                 self.log('Created the missing B branch on the server; its code is already up to date.')
@@ -619,7 +702,12 @@ class Sync:
             return dict(applied=applied)
         order = git(repo, 'rev-list', '--topo-order', '--reverse', ahead).decode().split()
         commits = [commit for commit in order if commit in requested]
-        self.log(('Syncing separate commits' if automatic else 'Combining source commits')
+        # A consecutive selection on a new branch is a complete source snapshot,
+        # not a series of patches against B's potentially unrelated default code.
+        snapshot = initial_snapshot or (not automatic and not exists and not applied and not base_branch and all(
+            git(repo, 'rev-list', '--parents', '-n', '1', current).decode().split()[1:] == [previous]
+            for previous, current in zip(commits, commits[1:])))
+        self.log(('Importing latest source snapshot' if initial_snapshot else 'Syncing separate commits' if automatic else 'Combining source commits')
                  + ', oldest first: ' + ', '.join(c[:12] for c in commits))
         git(repo, 'checkout', '--detach', '--force', bhead)
         git(repo, 'reset', '--hard', bhead)
@@ -628,10 +716,16 @@ class Sync:
                     git(repo, 'config', 'user.email').decode().strip())
         if not all(identity):
             raise SyncError('Configure Git user.name and user.email before syncing.')
-        self.log('Skipping .github/workflows/; existing workflows on B are preserved.')
-        if source_base:
+        self.log('Skipping .github/; existing .github files on B are preserved.')
+        if snapshot:
+            self.log('Creating the new B branch from the final selected source snapshot as one commit; B workflows are preserved.')
+            git(repo, 'read-tree', '--reset', '-u', commits[-1])
+            git(repo, 'rm', '-r', '-f', '--ignore-unmatch', '--', '.github')
+            if git(repo, 'ls-tree', '--name-only', bhead, '--', '.github').strip():
+                git(repo, 'checkout', bhead, '--', '.github')
+        elif source_base:
             git(repo, 'read-tree', '--reset', '-u', source_base)
-            git(repo, 'rm', '-r', '-f', '--ignore-unmatch', '--', '.github/workflows')
+            git(repo, 'rm', '-r', '-f', '--ignore-unmatch', '--', '.github')
             tree = git(repo, 'write-tree').decode().strip()
             checkpoint = git(repo, 'commit-tree', tree, '-F', '-',
                              data=('Initialize source baseline without workflows\n\nSource: ' + source_base + '\n').encode(),
@@ -639,11 +733,12 @@ class Sync:
             git(repo, 'checkout', '--detach', '--force', checkpoint)
             root_commit = False
         try:
-            for commit in commits:
+            for commit in ([] if snapshot else commits):
                 parents = git(repo, 'rev-list', '--parents', '-n', '1', commit).decode().split()[1:]
                 base = parents[0] if parents else git(repo, 'mktree', data=b'').decode().strip()
+                paths = ['.', ':(top,exclude).github']
                 patch = git(repo, 'diff', '--binary', '--full-index', '--no-renames', '--no-ext-diff', '--no-textconv',
-                            base, commit, '--', '.', ':(top,exclude).github/workflows')
+                            base, commit, '--', *paths)
                 if patch:
                     git(repo, 'apply', '--3way', '--index', data=patch)
                 if automatic and git(repo, 'diff', '--cached', '--name-only'):
@@ -664,33 +759,36 @@ class Sync:
         if automatic:
             if root_commit:
                 tree = git(repo, 'write-tree').decode().strip()
-                result = git(repo, 'commit-tree', tree, '-m', 'Initialize synced branch (workflows excluded)', identity=identity).decode().strip()
+                metadata = git(repo, 'show', '-s', '--format=format:%an%x00%ae%x00%aI%x00%B', ahead).split(b'\x00', 3)
+                commit_message = metadata[3].split(b'\n', 1)[0] if initial_snapshot else metadata[3]
+                result = git(repo, 'commit-tree', tree, '-F', '-', data=commit_message, identity=identity,
+                             author=(metadata[0].decode(), metadata[1].decode(), metadata[2].decode())).decode().strip()
                 git(repo, 'checkout', '--detach', '--force', result)
             result = sha('HEAD')
-        elif root_commit or git(repo, 'diff', '--cached', '--name-only'):
+        elif root_commit or snapshot or git(repo, 'diff', '--cached', '--name-only'):
             name = git(repo, 'config', 'user.name').decode().strip()
             email = git(repo, 'config', 'user.email').decode().strip()
             if not name or not email:
                 raise SyncError('Configure Git user.name and user.email before syncing.')
-            body = message.strip() + '\n\nSource commits (original authorship retained in A):\n'
-            body += '\n'.join(commits) + '\n'
+            body = message.strip().splitlines()[0]
             if root_commit:
                 tree = git(repo, 'write-tree').decode().strip()
                 result = git(repo, 'commit-tree', tree, '-F', '-', data=body.encode('utf-8'),
                              identity=(name, email)).decode().strip()
             else:
-                git(repo, 'commit', '--cleanup=verbatim', '--file=-', data=body.encode('utf-8'),
+                git(repo, 'commit', '--allow-empty', '--cleanup=verbatim', '--file=-', data=body.encode('utf-8'),
                     identity=(name, email))
                 result = sha('HEAD')
         else:
             result = sha('HEAD')
             self.log('Selected changes have no net difference on B; no new commit needed.')
-        done = list(dict.fromkeys(applied + commits))
-        save({'b': bhead, 'applied': applied, 'branch_existed': exists, 'exclude_workflows': True,
+        done = git(repo, 'rev-list', '--reverse', ahead).decode().split() if initial_snapshot else list(dict.fromkeys(applied + commits))
+        save({'b': bhead, 'applied': applied, 'branch_existed': exists, 'exclude_github': True,
+              'initial_snapshot': initial_snapshot,
               'pending': {'b': result, 'applied': done}})
         push(result)
         save({'b': result, 'applied': done})
-        self.log('New source commits synced separately.' if automatic else
+        self.log('Created B from the latest source snapshot as one commit.' if initial_snapshot else 'New source commits synced separately.' if automatic else
                  ('Selected changes synced as one commit.' if result != bhead else 'Selection recorded safely.'))
         return dict(applied=done)
 
@@ -702,7 +800,7 @@ def main():
     window.geometry('980x840')
     window.minsize(760, 680)
     # Keep the stored field order compatible with existing history and sync state.
-    fields, variables = [None] * 6, [None] * 6
+    fields, variables = [None] * 7, [None] * 7
     browse_buttons = []
     repositories = ttk.Frame(window, name='repositories')
     repositories.grid(row=1, column=0, columnspan=3, padx=10, pady=6, sticky='ew')
@@ -719,6 +817,11 @@ def main():
             entry = ttk.Entry(group, name=name, width=32, textvariable=variable)
             entry.grid(row=row, column=1, columnspan=1 if row == 0 else 2, pady=5, sticky='ew')
             variables[index], fields[index] = variable, entry
+        if source_index == 1:
+            ttk.Label(group, text='Base branch (optional)').grid(row=3, column=0, padx=(0, 8), pady=5, sticky='w')
+            variables[6] = tk.StringVar()
+            fields[6] = ttk.Entry(group, name='base_branch', width=32, textvariable=variables[6])
+            fields[6].grid(row=3, column=1, columnspan=2, pady=5, sticky='ew')
         def browse(source_index=source_index):
             path = filedialog.askdirectory(title='Choose source folder')
             if not path:
@@ -753,7 +856,7 @@ def main():
     tree.configure(yscrollcommand=scroll.set)
     scroll.pack(side='right', fill='y')
     tree.pack(side='left', fill='both', expand=True)
-    hint = tk.StringVar(value='Blank message: sync new commits separately. Custom message: select commits to combine.')
+    hint = tk.StringVar(value='Blank message + no base: copy A if B is new; otherwise sync new commits. Custom message: squash selection.')
     ttk.Label(window, textvariable=hint).grid(row=4, column=0, columnspan=3, padx=10, pady=5, sticky='w')
     ttk.Label(window, text='New commit message (optional)').grid(row=5, column=0, padx=10, sticky='nw')
     message = tk.Text(window, height=3, wrap='word')
@@ -768,7 +871,7 @@ def main():
     def values():
         return tuple(field.get().strip() for field in fields)
     def local_options(config):
-        return dict(local_a=config[4], local_b=config[5])
+        return dict(local_a=config[4], local_b=config[5], base_branch=config[6])
     def select_local_folder(index, url, folder):
         local = local_repository(folder, url)
         return str(local) if local else folder
@@ -853,7 +956,7 @@ def main():
                     for row in rows:
                         status = 'Already synced' if row['applied'] else ('Merge (unsupported)' if len(row['parents'].split()) > 1 else 'Available')
                         tree.insert('', 'end', iid=row['sha'], values=(row['sha'][:12], row['subject'], row['author'], status))
-                    hint.set('Ctrl/Shift-click to combine selected commits. A blank message syncs all new commits separately.')
+                    hint.set('Ctrl/Shift-click to combine commits. Blank message + no base: create B from A, or sync new commits into existing B.')
                     if restore:
                         available = [commit for commit in restore if tree.exists(commit)]
                         tree.selection_set(available)
@@ -940,7 +1043,8 @@ def main():
         if index < 0 or index >= len(history_rows):
             return
         record = history_rows[index]
-        for variable, value in zip(variables, record['inputs']):
+        restored = record['inputs'] + [''] * (len(variables) - len(record['inputs']))
+        for variable, value in zip(variables, restored):
             variable.set(value)
         message.delete('1.0', 'end')
         message.insert('1.0', record['message'])

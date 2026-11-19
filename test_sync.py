@@ -51,6 +51,51 @@ class Integration(unittest.TestCase):
         self.commit(self.a, 'A update')
         self.g(self.a, 'push', 'origin', 'feature')
 
+    def test_commit_preview_fetches_only_selected_branch_without_file_blobs(self):
+        bare = self.root / 'a.git'
+        self.g(bare, 'config', 'uploadpack.allowFilter', 'true')
+        self.change_a()
+        logs = []
+        self.sync.log = logs.append
+        rows = self.sync.run(str(bare), str(self.root / 'b.git'),
+                             'feature', 'feature', list_only=True)
+        self.assertEqual(rows[0]['subject'], 'A update')
+        preview = next((self.root / 'state').glob('*/preview-repo'))
+        refs = self.g(preview, 'for-each-ref', '--format=%(refname)', 'refs/remotes/')
+        self.assertEqual(refs, 'refs/remotes/source/feature')
+        objects = self.g(preview, 'rev-list', '--objects', '--missing=print',
+                         'refs/remotes/source/feature')
+        self.assertTrue(any(line.startswith('?') for line in objects.splitlines()))
+        self.assertFalse((preview.parent / 'repo').exists())
+        self.assertTrue(any('commit preview' in line for line in logs))
+        self.assertTrue(any('Receiving objects' in line or 'remote:' in line or 'From ' in line
+                            for line in logs))
+        # A subsequent sync uses complete objects, not the partial preview cache.
+        self.run_sync(True)
+        self.assertTrue((preview.parent / 'repo').exists())
+        (self.a / 'after-preview.txt').write_text('after preview\n')
+        self.commit(self.a, 'After preview')
+        self.g(self.a, 'push', 'origin', 'feature')
+        self.run_sync()
+        self.assertEqual(self.g(self.root / 'b.git', 'show', 'feature:after-preview.txt'), 'after preview')
+
+    def test_commit_preview_refreshes_tip_without_fetching_other_branches(self):
+        args = (str(self.root / 'a.git'), str(self.root / 'b.git'), 'feature', 'feature')
+        self.sync.run(*args, list_only=True)
+        self.change_a()
+        rows = self.sync.run(*args, list_only=True)
+        self.assertEqual(rows[0]['sha'], self.g(self.a, 'rev-parse', 'feature'))
+        preview = next((self.root / 'state').glob('*/preview-repo'))
+        self.assertEqual(self.g(preview, 'for-each-ref', '--format=%(refname)', 'refs/remotes/'),
+                         'refs/remotes/source/feature')
+
+    def test_streamed_git_failure_reports_error(self):
+        logs = []
+        with self.assertRaises(SyncError):
+            sync_tool.git(self.a, 'fetch', '--progress', 'origin', 'nonexistent-branch',
+                          progress=logs.append)
+        self.assertTrue(any('nonexistent-branch' in line for line in logs))
+
     def test_baseline_then_delta_and_noop(self):
         with self.assertRaises(SyncError):
             self.run_sync()
@@ -185,9 +230,7 @@ class Integration(unittest.TestCase):
         self.assertNotIn('unselected.txt', self.g(bare, 'ls-tree', '--name-only', 'release').splitlines())
         self.assertEqual(self.g(bare, 'show', 'release:b-work.txt'), 'keep B work')
         body = self.g(bare, 'show', '-s', '--format=%B', 'release')
-        self.assertTrue(body.startswith('Gộp hai thay đổi\n\nNội dung tùy chỉnh'))
-        self.assertIn(first, body)
-        self.assertIn(last, body)
+        self.assertEqual(body, 'Gộp hai thay đổi')
         self.assertEqual(self.g(bare, 'show', '-s', '--format=%an <%ae>|%cn <%ce>', 'release'),
                          'Test User <test@example.invalid>|Test User <test@example.invalid>')
         self.assertEqual(self.g(self.root / 'a.git', 'rev-parse', 'feature'), original_a)
@@ -218,6 +261,119 @@ class Integration(unittest.TestCase):
         base = self.g(self.root / 'b.git', 'rev-parse', 'main')
         self.selected_sync([commit])
         self.assertEqual(self.g(self.root / 'b.git', 'rev-parse', 'release^'), base)
+
+    def test_new_branch_squash_uses_final_selected_snapshot_without_conflicts(self):
+        # B's default code conflicts with A and has files absent from A.
+        (self.b / 'shared.txt').write_text('unrelated B code\n')
+        (self.b / 'only-b.txt').write_text('not in the source snapshot')
+        workflow = self.b / '.github' / 'workflows' / 'ci.yml'
+        workflow.parent.mkdir(parents=True)
+        workflow.write_text('B workflow\n')
+        self.commit(self.b, 'Different B default')
+        self.g(self.b, 'push', 'origin', 'main')
+        base = self.g(self.b, 'rev-parse', 'HEAD')
+        commits = []
+        for version in range(1, 4):
+            (self.a / 'shared.txt').write_text('version ' + str(version) + '\n')
+            (self.a / 'binary.bin').write_bytes(bytes([0, version, 255]))
+            if version == 1:
+                (self.a / 'kept-from-first.txt').write_text('keep first change')
+                (self.a / 'temporary.txt').write_text('removed later')
+            if version == 2:
+                (self.a / 'kept-from-second.txt').write_text('keep second change')
+                (self.a / 'temporary.txt').unlink()
+            self.commit(self.a, 'Version ' + str(version))
+            commits.append(self.g(self.a, 'rev-parse', 'HEAD'))
+        # A later unselected commit must not leak into the result.
+        self.change_a('unselected fourth version\n')
+        source_tip = self.g(self.a, 'rev-parse', 'HEAD')
+        message = 'feat(BTS-432): Change to color strategy in quote. removal of forced grouping for color'
+        self.selected_sync(list(reversed(commits)), message)
+        bare = self.root / 'b.git'
+        self.assertEqual(self.g(bare, 'rev-parse', 'release^'), base)
+        self.assertEqual(self.g(bare, 'rev-list', '--count', 'main..release'), '1')
+        self.assertEqual(self.g(bare, 'show', '-s', '--format=%B', 'release'), message)
+        self.assertEqual(self.g(bare, 'show', 'release:shared.txt'), 'version 3')
+        for filename in ['shared.txt', 'binary.bin', 'kept-from-first.txt', 'kept-from-second.txt']:
+            self.assertEqual(self.g(bare, 'rev-parse', 'release:' + filename),
+                             self.g(self.a, 'rev-parse', commits[-1] + ':' + filename))
+        files = self.g(bare, 'ls-tree', '-r', '--name-only', 'release').splitlines()
+        self.assertNotIn('temporary.txt', files)
+        self.assertNotIn('only-b.txt', files)
+        self.assertEqual(self.g(bare, 'show', 'release:.github/workflows/ci.yml'), 'B workflow')
+        self.assertEqual(self.g(self.a, 'rev-parse', 'HEAD'), source_tip)
+        tip = self.g(bare, 'rev-parse', 'release')
+        self.selected_sync(commits, message)
+        self.assertEqual(self.g(bare, 'rev-parse', 'release'), tip)
+
+    def test_explicit_base_branch_uses_latest_server_code_and_squashes_changes(self):
+        self.g(self.b, 'checkout', '-b', 'project')
+        (self.b / 'project-only.txt').write_text('project base')
+        self.commit(self.b, 'Project base')
+        old = self.g(self.b, 'rev-parse', 'HEAD')
+        (self.b / 'latest-project.txt').write_text('latest server base')
+        self.commit(self.b, 'Latest project')
+        self.g(self.b, 'push', 'origin', 'project')
+        base = self.g(self.b, 'rev-parse', 'HEAD')
+        self.g(self.b, 'reset', '--hard', old)  # Local project is stale.
+        commits = []
+        for text in ['first', 'second', 'third']:
+            self.change_a(text + '\n')
+            commits.append(self.g(self.a, 'rev-parse', 'HEAD'))
+        self.sync.run(str(self.root / 'a.git'), str(self.root / 'b.git'), 'feature', 'release',
+                      selected=list(reversed(commits)), message='Only my title',
+                      base_branch='project', local_b=str(self.b))
+        bare = self.root / 'b.git'
+        self.assertEqual(self.g(bare, 'rev-parse', 'release^'), base)
+        self.assertEqual(self.g(bare, 'rev-list', '--count', 'project..release'), '1')
+        self.assertEqual(self.g(bare, 'show', 'release:shared.txt'), 'third')
+        self.assertEqual(self.g(bare, 'show', 'release:project-only.txt'), 'project base')
+        self.assertEqual(self.g(bare, 'show', 'release:latest-project.txt'), 'latest server base')
+        self.assertEqual(self.g(bare, 'show', '-s', '--format=%B', 'release'), 'Only my title')
+        self.assertEqual(self.g(self.b, 'rev-parse', 'project'), old)
+        self.assertEqual(self.g(self.b, 'rev-parse', 'release'), self.g(bare, 'rev-parse', 'release'))
+
+    def test_missing_explicit_base_does_not_fall_back_or_push(self):
+        self.change_a()
+        commit = self.g(self.a, 'rev-parse', 'HEAD')
+        with self.assertRaisesRegex(SyncError, 'does not exist on Source B server'):
+            self.sync.run(str(self.root / 'a.git'), str(self.root / 'b.git'), 'feature', 'release',
+                          selected=[commit], message='Title', base_branch='missing-project')
+        self.assertEqual(self.g(self.root / 'b.git', 'for-each-ref', '--format=%(refname)', 'refs/heads/release'), '')
+
+    def test_existing_branch_ignores_optional_base(self):
+        first, _, last = self.selected_fixture()
+        self.sync.run(str(self.root / 'a.git'), str(self.root / 'b.git'), 'feature', 'release',
+                      selected=[first, last], message='Title', base_branch='missing-project')
+        self.assertEqual(self.g(self.root / 'b.git', 'show', 'release:b-work.txt'), 'keep B work')
+
+    def test_explicit_base_conflict_is_not_overwritten(self):
+        self.g(self.b, 'checkout', '-b', 'project')
+        (self.b / 'shared.txt').write_text('conflicting project code\n')
+        self.commit(self.b, 'Project conflicting code')
+        self.g(self.b, 'push', 'origin', 'project')
+        before = self.g(self.b, 'rev-parse', 'HEAD')
+        self.change_a()
+        with self.assertRaisesRegex(SyncError, 'conflict'):
+            self.sync.run(str(self.root / 'a.git'), str(self.root / 'b.git'), 'feature', 'release',
+                          selected=[self.g(self.a, 'rev-parse', 'HEAD')], message='Title', base_branch='project')
+        self.assertEqual(self.g(self.root / 'b.git', 'rev-parse', 'project'), before)
+        self.assertEqual(self.g(self.root / 'b.git', 'for-each-ref', '--format=%(refname)', 'refs/heads/release'), '')
+
+    def test_new_branch_snapshot_push_failure_recovers_one_commit(self):
+        self.change_a('snapshot\n')
+        commit = self.g(self.a, 'rev-parse', 'HEAD')
+        original = sync_tool.git
+        def fail_push(repo, *args, **kwargs):
+            if args[0] == 'push':
+                raise SyncError('Simulated push failure')
+            return original(repo, *args, **kwargs)
+        with patch('sync_tool.git', side_effect=fail_push):
+            with self.assertRaisesRegex(SyncError, 'push failure'):
+                self.selected_sync([commit])
+        self.selected_sync([commit])
+        self.assertEqual(self.g(self.root / 'b.git', 'rev-list', '--count', 'main..release'), '1')
+        self.assertEqual(self.g(self.root / 'b.git', 'show', 'release:shared.txt'), 'snapshot')
 
     def test_selected_pending_push_recovers_without_duplicate(self):
         first, _, last = self.selected_fixture()
@@ -302,7 +458,8 @@ class Integration(unittest.TestCase):
         self.sync.run(*urls, selected=[source_commit], message='Latest from server', **opts)
         self.assertEqual(self.g(self.root / 'b.git', 'show', 'release:shared.txt'), 'latest on server')
         self.assertEqual(self.g(self.root / 'b.git', 'rev-parse', 'release^'), latest_b)
-        self.assertEqual(self.g(self.root / 'b.git', 'show', 'release:server-b.txt'), 'latest B server content')
+        # A new branch uses A's snapshot, not files unique to B's default branch.
+        self.assertNotIn('server-b.txt', self.g(self.root / 'b.git', 'ls-tree', '--name-only', 'release').splitlines())
         self.assertEqual(self.g(stale_a, 'rev-parse', 'HEAD'), ahead_before)
         self.assertEqual(self.g(stale_b, 'rev-parse', 'HEAD'), bhead_before)
         self.assertEqual((stale_a / 'shared.txt').read_text(), 'local unsaved edit\n')
@@ -369,18 +526,24 @@ class Integration(unittest.TestCase):
         self.assertEqual(settings['url'], str(self.root / 'a.git'))
         self.assertEqual(sync_tool.local_repository(str(actual)), actual.resolve())
 
-    def test_history_can_restore_commits_older_than_current_list(self):
-        first, _, last = self.selected_fixture()
-        original = sync_tool.git
-        def short_list(repo, *args, **kwargs):
-            result = original(repo, *args, **kwargs)
-            if '--max-count=200' in args:
-                return result.splitlines(keepends=True)[0]
-            return result
-        with patch('sync_tool.git', side_effect=short_list):
-            rows = self.sync.run(str(self.root / 'a.git'), str(self.root / 'b.git'),
-                                 'feature', 'release', list_only=True, selected=[first, last])
-        self.assertEqual({row['sha'] for row in rows}, {first, last})
+    def test_preview_limits_history_and_saved_selections_to_latest_15(self):
+        first = self.g(self.a, 'rev-parse', 'HEAD')
+        for index in range(20):
+            self.g(self.a, 'commit', '--allow-empty', '-m', 'Preview commit ' + str(index))
+        self.g(self.a, 'push', 'origin', 'feature')
+        last = self.g(self.a, 'rev-parse', 'HEAD')
+        logs = []
+        self.sync.log = logs.append
+        args = (str(self.root / 'a.git'), str(self.root / 'b.git'), 'feature', 'release')
+        for _ in range(2):
+            rows = self.sync.run(*args, list_only=True, selected=[first, last])
+            self.assertEqual(len(rows), 15)
+            self.assertEqual(rows[0]['sha'], last)
+            self.assertNotIn(first, {row['sha'] for row in rows})
+        preview = next((self.root / 'state').glob('*/preview-repo'))
+        self.assertEqual(self.g(preview, 'rev-parse', '--is-shallow-repository'), 'true')
+        self.assertEqual(self.g(preview, 'rev-list', '--count', 'refs/remotes/source/feature'), '15')
+        self.assertTrue(any('outside the latest 15' in line for line in logs))
 
     def test_non_root_and_missing_folder_are_ignored(self):
         inside = self.a / 'src' / 'components'
@@ -414,7 +577,38 @@ class Integration(unittest.TestCase):
         return self.sync.run(str(self.root / 'a.git'), str(self.root / 'b.git'),
                              'feature', 'release', message='', preserve_commits=True)
 
-    def test_blank_message_syncs_separate_commits_with_original_messages_and_authors(self):
+    def test_new_b_uses_one_latest_snapshot_without_replaying_merge_history(self):
+        self.g(self.a, 'checkout', '-b', 'side')
+        (self.a / 'side.txt').write_text('side code')
+        self.commit(self.a, 'Original side commit')
+        self.g(self.a, 'checkout', 'feature')
+        self.change_a('mainline update\n')
+        self.g(self.a, 'merge', '--no-ff', 'side', '-m', 'Original merge title\n\nOriginal description')
+        self.g(self.a, 'push', 'origin', 'feature')
+        ahead = self.g(self.a, 'rev-parse', 'HEAD')
+        original = sync_tool.git
+        with patch('sync_tool.git', wraps=original) as commands:
+            self.automatic_sync()
+        invoked = [call.args[1] for call in commands.call_args_list]
+        self.assertNotIn('apply', invoked)
+        self.assertEqual(invoked.count('commit-tree'), 1)
+        bare = self.root / 'b.git'
+        self.assertEqual(self.g(bare, 'rev-list', '--count', 'release'), '1')
+        self.assertEqual(self.g(bare, 'rev-parse', 'release^{tree}'), self.g(self.a, 'rev-parse', ahead + '^{tree}'))
+        self.assertEqual(self.g(bare, 'show', '-s', '--format=%B', 'release'), 'Original merge title')
+        tip = self.g(bare, 'rev-parse', 'release')
+        self.automatic_sync()
+        self.assertEqual(self.g(bare, 'rev-parse', 'release'), tip)
+        self.change_a('next exact commit\n')
+        self.automatic_sync()
+        self.assertEqual(self.g(bare, 'rev-parse', 'release^'), tip)
+        self.assertEqual(self.g(bare, 'show', 'release:shared.txt'), 'next exact commit')
+
+    def replay_sync(self):
+        return self.sync.run(str(self.root / 'a.git'), str(self.root / 'b.git'),
+                             'feature', 'release', message='', preserve_commits=True, base_branch='main')
+
+    def test_explicit_base_syncs_separate_commits_with_original_messages_and_authors(self):
         before = self.common_target()
         with patch.dict(os.environ, {'GIT_AUTHOR_NAME': 'Original Writer', 'GIT_AUTHOR_EMAIL': 'writer@example.invalid'}):
             self.change_a('first automatic change\n')
@@ -423,7 +617,7 @@ class Integration(unittest.TestCase):
             self.commit(self.a, 'Second original subject\n\nOriginal body')
             self.g(self.a, 'push', 'origin', 'feature')
         source_tip = self.g(self.a, 'rev-parse', 'HEAD')
-        self.automatic_sync()
+        self.replay_sync()
         bare = self.root / 'b.git'
         self.assertEqual(self.g(bare, 'rev-parse', 'release~2'), before)
         self.assertEqual(self.g(bare, 'rev-list', '--count', before + '..release'), '2')
@@ -434,16 +628,16 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.g(bare, 'show', '-s', '--format=%an <%ae>|%cn <%ce>', 'release'),
                          'Original Writer <writer@example.invalid>|Test User <test@example.invalid>')
         tip = self.g(bare, 'rev-parse', 'release')
-        self.automatic_sync()
+        self.replay_sync()
         self.assertEqual(tip, self.g(bare, 'rev-parse', 'release'))
         self.assertEqual(self.g(self.root / 'a.git', 'rev-parse', 'feature'), source_tip)
 
-    def test_blank_message_after_squash_only_syncs_new_commits(self):
+    def test_explicit_base_after_squash_only_syncs_new_commits(self):
         first, _, last = self.selected_fixture()
         self.selected_sync([first, last])
         before = self.g(self.root / 'b.git', 'rev-parse', 'release')
         self.change_a('new after squash\n')
-        self.automatic_sync()
+        self.replay_sync()
         self.assertEqual(self.g(self.root / 'b.git', 'rev-parse', 'release^'), before)
         self.assertEqual(self.g(self.root / 'b.git', 'show', 'release:shared.txt'), 'new after squash')
 
@@ -461,14 +655,62 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.g(self.root / 'b.git', 'rev-parse', 'release'), before)
         self.assertEqual(list((self.root / 'state').glob('*/selected-state.json')), [])
 
-    def test_blank_message_unrelated_first_sync_requires_explicit_commits(self):
+    def test_existing_unrelated_b_syncs_latest_commit_then_only_new_commits(self):
         self.g(self.b, 'checkout', '--orphan', 'release')
+        (self.b / 'b-only.txt').write_text('keep B code')
         self.commit(self.b, 'Unrelated root')
         self.g(self.b, 'push', 'origin', 'release')
         before = self.g(self.b, 'rev-parse', 'HEAD')
-        with self.assertRaisesRegex(SyncError, 'unrelated histories'):
-            self.automatic_sync()
-        self.assertEqual(self.g(self.root / 'b.git', 'rev-parse', 'release'), before)
+        (self.a / 'older.txt').write_text('older unselected source change')
+        self.commit(self.a, 'Older A commit')
+        self.change_a('latest A code\n')
+        source = self.g(self.a, 'rev-parse', 'HEAD')
+        self.automatic_sync()
+        bare = self.root / 'b.git'
+        self.assertEqual(self.g(bare, 'rev-parse', 'release^'), before)
+        self.assertEqual(self.g(bare, 'show', 'release:shared.txt'), 'latest A code')
+        self.assertEqual(self.g(bare, 'show', 'release:b-only.txt'), 'keep B code')
+        self.assertNotIn('older.txt', self.g(bare, 'ls-tree', '--name-only', 'release').splitlines())
+        self.assertEqual(self.g(bare, 'show', '-s', '--format=%B', 'release'),
+                         self.g(self.a, 'show', '-s', '--format=%B', source))
+        tip = self.g(bare, 'rev-parse', 'release')
+        self.automatic_sync()
+        self.assertEqual(self.g(bare, 'rev-parse', 'release'), tip)
+        self.change_a('next A change\n')
+        self.automatic_sync()
+        self.assertEqual(self.g(bare, 'rev-parse', 'release^'), tip)
+        self.assertEqual(self.g(bare, 'show', 'release:shared.txt'), 'next A change')
+
+    def test_existing_divergent_b_blank_options_replays_code_but_excludes_github(self):
+        before = self.target_workflow()
+        self.workflow_changes()
+        self.automatic_sync()
+        bare = self.root / 'b.git'
+        self.assertEqual(self.g(bare, 'rev-parse', 'release^'), before)
+        self.assertEqual(self.g(bare, 'show', 'release:b-only.txt'), 'existing B work')
+        self.assertEqual(self.g(bare, 'show', 'release:.github/workflows/deploy.yml'), 'keep existing B workflow')
+        self.assertEqual(self.g(bare, 'show', '-s', '--format=%B', 'release'), 'Mixed code and workflow')
+        tip = self.g(bare, 'rev-parse', 'release')
+        self.automatic_sync()
+        self.assertEqual(self.g(bare, 'rev-parse', 'release'), tip)
+
+    def test_existing_b_blank_options_failed_push_retries_without_duplicate(self):
+        self.common_target()
+        self.change_a('retry new code\n')
+        original = sync_tool.git
+        def fail_push(repo, *args, **kwargs):
+            if args[0] == 'push':
+                raise SyncError('Simulated push failure')
+            return original(repo, *args, **kwargs)
+        with patch('sync_tool.git', side_effect=fail_push):
+            with self.assertRaisesRegex(SyncError, 'push failure'):
+                self.automatic_sync()
+        self.automatic_sync()
+        bare = self.root / 'b.git'
+        tip = self.g(bare, 'rev-parse', 'release')
+        self.assertEqual(self.g(bare, 'show', 'release:shared.txt'), 'retry new code')
+        self.automatic_sync()
+        self.assertEqual(self.g(bare, 'rev-parse', 'release'), tip)
 
     def empty_target(self):
         self.g(self.root / 'b.git', 'update-ref', '-d', 'refs/heads/main')
@@ -495,7 +737,7 @@ class Integration(unittest.TestCase):
         self.change_a('second selected change\n')
         second = self.g(self.a, 'rev-parse', 'HEAD')
         self.selected_sync([first, second], 'Initial combined import')
-        self.assertEqual(self.g(self.root / 'b.git', 'show', 'release^:shared.txt'), 'base')
+        self.assertEqual(self.g(self.root / 'b.git', 'rev-list', '--count', 'release'), '1')
         self.assertEqual(self.g(self.root / 'b.git', 'show', '-s', '--format=%s', 'release'), 'Initial combined import')
         self.assertEqual(self.g(self.root / 'b.git', 'show', 'release:shared.txt'), 'second selected change')
 
@@ -533,6 +775,7 @@ class Integration(unittest.TestCase):
                 self.automatic_sync()
         self.automatic_sync()
         self.assertEqual(self.g(self.root / 'b.git', 'rev-parse', 'release^{tree}'), self.g(self.a, 'rev-parse', 'HEAD^{tree}'))
+        self.assertEqual(self.g(self.root / 'b.git', 'rev-list', '--count', 'release'), '1')
 
     def workflow_changes(self):
         path = self.a / '.github' / 'workflows' / 'deploy.yml'
@@ -556,10 +799,10 @@ class Integration(unittest.TestCase):
         self.g(self.b, 'push', 'origin', 'release')
         return self.g(self.b, 'rev-parse', 'HEAD')
 
-    def test_default_excludes_workflows_and_skips_workflow_only_commits(self):
+    def test_explicit_base_excludes_workflows_and_skips_workflow_only_commits(self):
         before = self.target_workflow()
         self.workflow_changes()
-        self.automatic_sync()
+        self.replay_sync()
         bare = self.root / 'b.git'
         self.assertEqual(self.g(bare, 'show', 'release:.github/workflows/deploy.yml'), 'keep existing B workflow')
         self.assertEqual(self.g(bare, 'show', 'release:code.txt'), 'code to copy')
@@ -575,15 +818,61 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.g(bare, 'show', 'release:code.txt'), 'code to copy')
         self.assertEqual(self.g(bare, 'show', 'release:.github/workflows/deploy.yml'), 'keep existing B workflow')
 
-    def test_empty_target_history_contains_no_source_workflows(self):
-        self.empty_target()
+    def test_blank_sync_excludes_github_even_when_b_can_fast_forward(self):
+        source_root = self.g(self.a, 'rev-parse', 'HEAD')
+        self.g(self.root / 'b.git', 'fetch', str(self.a), source_root + ':refs/heads/release')
         self.workflow_changes()
         self.automatic_sync()
         bare = self.root / 'b.git'
-        self.assertEqual(self.g(bare, 'log', '--format=', '--name-only', 'release', '--', '.github/workflows'), '')
+        self.assertEqual(self.g(bare, 'rev-parse', 'release^'), source_root)
+        self.assertEqual(self.g(bare, 'log', '--format=', '--name-only', 'release', '--', '.github'), '')
         self.assertEqual(self.g(bare, 'show', 'release:code.txt'), 'code to copy')
 
-    def test_old_pending_push_is_rebuilt_without_workflows(self):
+    def test_blank_sync_preserves_b_github_configuration(self):
+        self.common_target()
+        folder = self.b / '.github'
+        folder.mkdir()
+        (folder / 'CODEOWNERS').write_text('B owners\n')
+        self.commit(self.b, 'B owners')
+        self.g(self.b, 'push', 'origin', 'release')
+        before = self.g(self.b, 'rev-parse', 'HEAD')
+        self.workflow_changes()
+        (self.a / '.github' / 'CODEOWNERS').write_text('A owners\n')
+        self.commit(self.a, 'A owners')
+        self.g(self.a, 'push', 'origin', 'feature')
+        self.automatic_sync()
+        bare = self.root / 'b.git'
+        self.assertEqual(self.g(bare, 'show', 'release:.github/CODEOWNERS'), 'B owners')
+        self.assertEqual(self.g(bare, 'diff', '--name-only', before, 'release', '--', '.github'), '')
+        self.assertEqual(self.g(bare, 'show', 'release:code.txt'), 'code to copy')
+
+    def test_new_blank_sync_filters_deleted_github_from_all_ancestors(self):
+        self.workflow_changes()
+        self.g(self.a, 'rm', '-r', '.github')
+        self.commit(self.a, 'Delete GitHub files')
+        self.g(self.a, 'push', 'origin', 'feature')
+        self.automatic_sync()
+        bare = self.root / 'b.git'
+        self.assertEqual(self.g(bare, 'log', '--format=', '--name-only', 'release', '--', '.github'), '')
+        self.assertEqual(self.g(bare, 'show', 'release:code.txt'), 'code to copy')
+
+    def test_empty_target_blank_sync_excludes_all_github_history(self):
+        self.empty_target()
+        self.workflow_changes()
+        (self.a / '.github' / 'CODEOWNERS').write_text('* @source-owner\n')
+        self.commit(self.a, 'GitHub configuration only')
+        self.g(self.a, 'push', 'origin', 'feature')
+        self.automatic_sync()
+        bare = self.root / 'b.git'
+        self.assertEqual(self.g(bare, 'log', '--format=', '--name-only', 'release', '--', '.github'), '')
+        self.assertEqual(self.g(bare, 'show', 'release:code.txt'), 'code to copy')
+        self.assertEqual(self.g(bare, 'show', '-s', '--format=%B', 'release'), 'GitHub configuration only')
+        self.assertEqual(self.g(bare, 'rev-list', '--count', 'release'), '1')
+        tip = self.g(bare, 'rev-parse', 'release')
+        self.automatic_sync()
+        self.assertEqual(self.g(bare, 'rev-parse', 'release'), tip)
+
+    def test_exact_sync_does_not_replay_old_filtered_pending_push(self):
         import json
         self.empty_target()
         self.workflow_changes()
@@ -595,10 +884,11 @@ class Integration(unittest.TestCase):
             'b': ahead, 'applied': [], 'branch_existed': False,
             'pending': {'b': ahead, 'applied': imported}}), encoding='utf-8')
         self.automatic_sync()
-        self.assertEqual(len(list(folder.glob('pending-before-workflow-filter-*.json'))), 1)
         bare = self.root / 'b.git'
         self.assertEqual(self.g(bare, 'show', 'release:code.txt'), 'code to copy')
-        self.assertEqual(self.g(bare, 'log', '--format=', '--name-only', 'release', '--', '.github/workflows'), '')
+        self.assertEqual(self.g(bare, 'log', '--format=', '--name-only', 'release', '--', '.github'), '')
+        self.assertEqual(self.g(bare, 'rev-list', '--count', 'release'), '1')
+        self.assertEqual(len(list(folder.glob('pending-before-snapshot-*.json'))), 1)
 
     def test_empty_target_workflow_only_selection_pushes_filtered_baseline(self):
         self.empty_target()
@@ -633,7 +923,7 @@ class Integration(unittest.TestCase):
         self.sync.run(str(self.root / 'a.git'), str(self.root / 'b.git'), 'feature', 'release',
                       preserve_commits=True, local_b=str(local_b))
         self.assertEqual((local_b / 'code.txt').read_text(), 'code to copy\n')
-        self.assertFalse((local_b / '.github' / 'workflows').exists())
+        self.assertFalse((local_b / '.github').exists())
         self.assertEqual(self.g(local_b, 'rev-parse', 'HEAD'), self.g(self.root / 'b.git', 'rev-parse', 'release'))
 
     def test_missing_b_branch_with_unrelated_default_imports_full_source_code(self):
@@ -651,10 +941,11 @@ class Integration(unittest.TestCase):
         self.automatic_sync()
         bare = self.root / 'b.git'
         self.assertEqual(self.g(bare, 'show', 'release:code.txt'), 'code to copy')
-        self.assertEqual(self.g(bare, 'show', 'release:.github/workflows/deploy.yml'), 'keep B workflow')
+        self.assertEqual(self.g(bare, 'log', '--format=', '--name-only', 'release', '--', '.github'), '')
         self.assertNotIn('b-only.txt', self.g(bare, 'ls-tree', '--name-only', 'release').splitlines())
         self.assertEqual(self.g(bare, 'rev-parse', 'unrelated'), default_before)
-        self.assertEqual(self.g(bare, 'rev-parse', 'release^'), default_before)
+        self.assertEqual(self.g(bare, 'show', '-s', '--format=%B', 'release'), 'Only workflow changes')
+        self.assertEqual(self.g(bare, 'rev-list', '--count', 'release'), '1')
 
     def test_deleted_b_branch_is_recreated_from_source(self):
         self.empty_target()
@@ -663,26 +954,25 @@ class Integration(unittest.TestCase):
         self.g(self.root / 'b.git', 'update-ref', '-d', 'refs/heads/release')
         self.automatic_sync()
         self.assertEqual(self.g(self.root / 'b.git', 'show', 'release:code.txt'), 'code to copy')
-        self.assertEqual(self.g(self.root / 'b.git', 'log', '--format=', '--name-only', 'release', '--', '.github/workflows'), '')
-        self.assertEqual(len(list((self.root / 'state').glob('*/state-before-branch-recreation-*.json'))), 1)
+        self.assertEqual(self.g(self.root / 'b.git', 'log', '--format=', '--name-only', 'release', '--', '.github'), '')
 
     def test_existing_local_b_branch_fast_forwards_after_server_sync(self):
         self.common_target()
         self.change_a('update local and server\n')
         self.sync.run(str(self.root / 'a.git'), str(self.root / 'b.git'), 'feature', 'release',
-                      preserve_commits=True, local_b=str(self.b))
+                      preserve_commits=True, local_b=str(self.b), base_branch='main')
         self.assertEqual((self.b / 'shared.txt').read_text(), 'update local and server\n')
         self.assertEqual(self.g(self.b, 'rev-parse', 'HEAD'), self.g(self.root / 'b.git', 'rev-parse', 'release'))
 
     def test_preinitialized_empty_local_b_gets_origin_and_code(self):
         self.common_target()
         self.change_a('populate initialized folder\n')
-        self.automatic_sync()
+        self.replay_sync()
         local_b = self.root / 'manual-init'
         local_b.mkdir()
         self.g(local_b, 'init', '--initial-branch=main')
         self.sync.run(str(self.root / 'a.git'), str(self.root / 'b.git'), 'feature', 'release',
-                      preserve_commits=True, local_b=str(local_b))
+                      preserve_commits=True, local_b=str(local_b), base_branch='main')
         self.assertEqual((local_b / 'shared.txt').read_text(), 'populate initialized folder\n')
         self.assertEqual(self.g(local_b, 'branch', '--show-current'), 'release')
 
@@ -698,7 +988,7 @@ class Integration(unittest.TestCase):
         (self.b / 'shared.txt').write_text('keep local unfinished work\n')
         self.change_a('new server code\n')
         self.sync.run(str(self.root / 'a.git'), str(self.root / 'b.git'), 'feature', 'release',
-                      preserve_commits=True, local_b=str(self.b))
+                      preserve_commits=True, local_b=str(self.b), base_branch='main')
         self.assertEqual((self.b / 'shared.txt').read_text(), 'keep local unfinished work\n')
         self.assertEqual(self.g(self.b, 'rev-parse', 'HEAD'), before)
         self.assertEqual(self.g(self.root / 'b.git', 'show', 'release:shared.txt'), 'new server code')
@@ -712,7 +1002,7 @@ class Integration(unittest.TestCase):
         self.g(self.a, 'push', 'origin', 'feature')
         with self.assertRaisesRegex(SyncError, 'Server sync completed, but local B'):
             self.sync.run(str(self.root / 'a.git'), str(self.root / 'b.git'), 'feature', 'release',
-                          preserve_commits=True, local_b=str(self.b))
+                          preserve_commits=True, local_b=str(self.b), base_branch='main')
         self.assertEqual((self.b / 'local-settings.txt').read_text(), 'keep local settings')
         self.assertEqual(self.g(self.root / 'b.git', 'show', 'release:local-settings.txt'), 'server version')
 
@@ -746,7 +1036,7 @@ class History(unittest.TestCase):
                           '`.github/workflows/deploy.yml` without `workflow` scope')
         text = sync_tool.push_error_message('Push to Source B', error)
         self.assertIn('lacks workflow permission', text)
-        self.assertIn('pending sync is saved', text)
+        self.assertIn('No workflow files were removed', text)
         self.assertIn('.github/workflows/deploy.yml', text)
         self.assertNotIn('delete', text.lower())
 
@@ -856,6 +1146,8 @@ class Interface(unittest.TestCase):
                                      for w in widgets))
                 self.assertEqual(len([w for w in widgets if isinstance(w, sync_tool.ttk.Combobox)]), 1)
                 entries = self.repo_fields(window)
+                base_entry = window.nametowidget('repositories.source_b.base_branch')
+                base_entry.insert(0, 'project')
                 for field, value in zip(entries, ['a-url', 'b-url', 'dev', 'release', 'a-folder', 'b-folder']):
                     field.insert(0, value)
                 browse = next(w for w in widgets if isinstance(w, sync_tool.ttk.Button) and w.cget('text').startswith('Browse'))
@@ -878,12 +1170,13 @@ class Interface(unittest.TestCase):
                 self.assertEqual(calls[-1][1]['message'], 'My custom squash\n\nDetails')
                 self.assertEqual(calls[-1][1]['local_a'], 'chosen-a-folder')
                 self.assertEqual(calls[-1][1]['local_b'], 'b-folder')
+                self.assertEqual(calls[-1][1]['base_branch'], 'project')
                 window.after(130, window.quit)
                 original_loop(window)
                 saved = sync_tool.HistoryStore(Path(temp) / 'GitSyncTool').read()
                 self.assertEqual(len(saved), 1)
                 self.assertEqual(saved[0]['status'], 'Completed')
-                self.assertEqual(saved[0]['inputs'], ['a-url', 'b-url', 'dev', 'release', 'chosen-a-folder', 'b-folder'])
+                self.assertEqual(saved[0]['inputs'], ['a-url', 'b-url', 'dev', 'release', 'chosen-a-folder', 'b-folder', 'project'])
                 entries[2].delete(0, 'end')
                 self.assertEqual(tree.get_children(), ())
                 message.delete('1.0', 'end')
@@ -894,7 +1187,7 @@ class Interface(unittest.TestCase):
                 open_history.invoke()
                 window.after(130, window.quit)
                 original_loop(window)
-                self.assertEqual([w.get() for w in entries], saved[0]['inputs'])
+                self.assertEqual([w.get() for w in entries] + [base_entry.get()], saved[0]['inputs'])
                 self.assertEqual(message.get('1.0', 'end-1c'), 'My custom squash\n\nDetails')
                 self.assertEqual(set(tree.selection()), {'a' * 40, 'b' * 40})
                 self.assertEqual(len(calls), before_calls + 1)
