@@ -895,6 +895,24 @@ def main():
     tree.configure(yscrollcommand=scroll.set)
     scroll.pack(side='right', fill='y')
     tree.pack(side='left', fill='both', expand=True)
+    commit_menu = tk.Menu(tree, name='commit_menu', tearoff=False)
+    context_commit = None
+    def copy_commit_name():
+        if context_commit and tree.exists(context_commit):
+            window.clipboard_clear()
+            window.clipboard_append(tree.set(context_commit, 'subject'))
+    commit_menu.add_command(label='Copy commit name', command=copy_commit_name)
+    def show_commit_menu(event):
+        nonlocal context_commit
+        context_commit = tree.identify_row(event.y)
+        if not context_commit or tree.identify_region(event.x, event.y) not in ('cell', 'tree'):
+            return
+        try:
+            commit_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            commit_menu.grab_release()
+        return 'break'
+    tree.bind('<Button-3>', show_commit_menu)
     hint = tk.StringVar(value='Blank message + no base: copy A if B is new; otherwise sync new commits. Custom message: squash selection.')
     ttk.Label(window, textvariable=hint).grid(row=4, column=0, columnspan=3, padx=10, pady=5, sticky='w')
     ttk.Label(window, text='New commit message (optional)').grid(row=5, column=0, padx=10, sticky='nw')

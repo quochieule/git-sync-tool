@@ -1152,6 +1152,33 @@ class Interface(unittest.TestCase):
         return [window.nametowidget('repositories.' + source + '.' + name)
                 for name in ('url', 'branch', 'folder') for source in ('source_a', 'source_b')]
 
+    def test_right_click_copies_commit_name_without_changing_selection(self):
+        def inspect(window):
+            try:
+                table = next(w for frame in window.winfo_children() for w in frame.winfo_children()
+                             if isinstance(w, sync_tool.ttk.Treeview))
+                table.insert('', 'end', iid='first', values=('aaa', 'First commit', 'Author', 'Available'))
+                title = 'Sửa lỗi: giữ nguyên tiêu đề commit'
+                table.insert('', 'end', iid='second', values=('bbb', title, 'Author', 'Available'))
+                table.selection_set('first')
+                window.update()
+                menu = table.nametowidget('commit_menu')
+                x, y, width, height = table.bbox('second', 'subject')
+                with patch.object(menu, 'tk_popup') as popup, patch.object(menu, 'grab_release'):
+                    table.event_generate('<Button-3>', x=x + 5, y=y + height // 2)
+                    popup.assert_called_once()
+                    menu.invoke(0)
+                    self.assertEqual(window.clipboard_get(), title)
+                    self.assertEqual(table.selection(), ('first',))
+                with patch.object(menu, 'tk_popup') as popup:
+                    table.event_generate('<Button-3>', x=5, y=2)
+                    popup.assert_not_called()
+            finally:
+                self.close_window(window)
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'LOCALAPPDATA': temp}), \
+                patch.object(sync_tool.tk.Tk, 'mainloop', inspect):
+            sync_tool.main()
+
     def test_load_select_message_and_local_folder_wiring(self):
         calls = []
         rows = [dict(sha='a' * 40, parents='c' * 40, author='Original A', subject='First', applied=False),
