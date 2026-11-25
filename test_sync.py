@@ -8,6 +8,31 @@ from sync_tool import Sync, SyncError
 import sync_tool
 
 
+class GitProcesses(unittest.TestCase):
+    def test_process_options_are_platform_specific(self):
+        with patch.object(sync_tool.os, 'name', 'nt'), \
+                patch.object(subprocess, 'CREATE_NO_WINDOW', 0x08000000, create=True):
+            self.assertEqual(sync_tool.git_process_options(), {'creationflags': 0x08000000})
+        with patch.object(sync_tool.os, 'name', 'posix'):
+            self.assertEqual(sync_tool.git_process_options(), {})
+
+    def test_normal_and_streaming_git_hide_child_consoles(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(subprocess, 'Popen', wraps=subprocess.Popen) as popen:
+                output = sync_tool.git(folder, '--version')
+                lines = []
+                streamed = sync_tool.git(folder, '--version', progress=lines.append)
+            self.assertIn(b'git version', output)
+            self.assertIn(b'git version', streamed)
+            self.assertTrue(lines)
+            self.assertEqual(popen.call_count, 2)
+            for call in popen.call_args_list:
+                if os.name == 'nt':
+                    self.assertEqual(call.kwargs['creationflags'], subprocess.CREATE_NO_WINDOW)
+                else:
+                    self.assertNotIn('creationflags', call.kwargs)
+
+
 class Integration(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

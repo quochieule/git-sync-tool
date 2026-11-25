@@ -195,6 +195,11 @@ class HistoryStore:
             self._write(lambda rows: None)
 
 
+def git_process_options():
+    # A windowed EXE has no console to inherit: hide consoles for child Git processes.
+    return {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
+
+
 def git(repo, *args, data=None, identity=None, author=None, progress=None):
     env = dict(os.environ, GIT_TERMINAL_PROMPT='0', GCM_INTERACTIVE='Never')
     if identity:
@@ -208,7 +213,8 @@ def git(repo, *args, data=None, identity=None, author=None, progress=None):
             raise ValueError('Progress streaming does not accept stdin data.')
         output = []
         with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              env=env, text=True, encoding='utf-8', errors='replace') as process:
+                              env=env, text=True, encoding='utf-8', errors='replace',
+                              **git_process_options()) as process:
             for line in process.stdout:
                 line = line.rstrip()
                 if line:
@@ -219,7 +225,7 @@ def git(repo, *args, data=None, identity=None, author=None, progress=None):
             raise SyncError('\n'.join(output) or 'Git command failed')
         return '\n'.join(output).encode('utf-8')
     p = subprocess.run(command, input=data,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, **git_process_options())
     if p.returncode:
         raise SyncError(p.stderr.decode(errors='replace').strip() or 'Git command failed')
     return p.stdout
@@ -278,7 +284,8 @@ class Sync:
                 git(local, 'remote', 'add', remote, target['url'])
             tracking = 'refs/remotes/' + remote + '/' + branch
             git(local, 'fetch', '--no-tags', remote, '+refs/heads/' + branch + ':' + tracking)
-            head = subprocess.run(['git', '-C', str(local), 'rev-parse', '--verify', 'HEAD'], capture_output=True)
+            head = subprocess.run(['git', '-C', str(local), 'rev-parse', '--verify', 'HEAD'],
+                                  capture_output=True, **git_process_options())
             dirty = git(local, 'status', '--porcelain', '--untracked-files=all')
             if head.returncode:
                 if dirty:
@@ -287,12 +294,14 @@ class Sync:
                 git(local, 'checkout', '--no-overwrite-ignore', '-B', branch, '--track', remote + '/' + branch)
                 self.log('Source B folder now contains the synced code on branch ' + branch + '.')
                 return
-            current = subprocess.run(['git', '-C', str(local), 'symbolic-ref', '--quiet', '--short', 'HEAD'], capture_output=True)
+            current = subprocess.run(['git', '-C', str(local), 'symbolic-ref', '--quiet', '--short', 'HEAD'],
+                                     capture_output=True, **git_process_options())
             if current.stdout.decode().strip() == branch:
                 if dirty:
                     self.log('Local B has uncommitted changes; server sync succeeded and those local changes were preserved.')
                     return
-                ff = subprocess.run(['git', '-C', str(local), 'merge-base', '--is-ancestor', 'HEAD', tracking], capture_output=True)
+                ff = subprocess.run(['git', '-C', str(local), 'merge-base', '--is-ancestor', 'HEAD', tracking],
+                                    capture_output=True, **git_process_options())
                 if ff.returncode == 0:
                     git(local, 'merge', '--ff-only', '--no-edit', '--no-overwrite-ignore', tracking)
                     self.log('Local Source B is up to date with the server branch.')
@@ -364,7 +373,8 @@ class Sync:
         def sha(ref):
             return git(repo, 'rev-parse', ref).decode().strip()
         def ancestor(old, new):
-            p = subprocess.run(['git', '-C', str(repo), 'merge-base', '--is-ancestor', old, new], capture_output=True)
+            p = subprocess.run(['git', '-C', str(repo), 'merge-base', '--is-ancestor', old, new],
+                               capture_output=True, **git_process_options())
             if p.returncode not in (0, 1):
                 raise SyncError('Cannot validate commit history.')
             return p.returncode == 0
@@ -684,7 +694,8 @@ class Sync:
                 if not ancestor(legacy['a'], ahead) or not exists or not ancestor(legacy['b'], bhead):
                     raise SyncError('A or B history diverged from the saved baseline. Review manually.')
                 anchors.append(legacy['a'])
-            common = subprocess.run(['git', '-C', str(repo), 'merge-base', ahead, bhead], capture_output=True)
+            common = subprocess.run(['git', '-C', str(repo), 'merge-base', ahead, bhead],
+                                    capture_output=True, **git_process_options())
             if common.returncode not in (0, 1):
                 raise SyncError('Cannot determine the common source/target history.')
             if not exists and not empty_target and not applied and common.returncode == 1 and not base_branch:

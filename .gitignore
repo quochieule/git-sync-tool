@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .ezcode/
+dist/
+build/
+*.spec
